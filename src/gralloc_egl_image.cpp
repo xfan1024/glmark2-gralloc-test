@@ -175,14 +175,17 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
         die_msg("gbm_bo_get_stride returned 0");
     }
     fprintf(stderr, "[Gralloc_GBM] Buffer stride: %u bytes\n", stride);
-
+    uint32_t offset = gbm_bo_get_offset(bo, 0);
+    uint64_t mod = gbm_bo_get_modifier(bo);
     EGLint attrs[] = {
         EGL_WIDTH, width,
         EGL_HEIGHT, height,
         EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_XRGB8888,
         EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)stride,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)offset,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(mod & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(mod >> 32),
         EGL_NONE
     };
 
@@ -230,6 +233,7 @@ static struct gralloc_image alloc_image_from_dumb(EGLDisplay dpy, int width, int
         die_errno("drmPrimeHandleToFD");
     }
 
+    uint64_t mod = DRM_FORMAT_MOD_LINEAR;
     EGLint attrs[] = {
         EGL_WIDTH, width,
         EGL_HEIGHT, height,
@@ -237,6 +241,8 @@ static struct gralloc_image alloc_image_from_dumb(EGLDisplay dpy, int width, int
         EGL_DMA_BUF_PLANE0_FD_EXT, dma_fd,
         EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
         EGL_DMA_BUF_PLANE0_PITCH_EXT, (EGLint)create_req.pitch,
+        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (EGLint)(mod & 0xffffffff),
+        EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (EGLint)(mod >> 32),
         EGL_NONE
     };
 
