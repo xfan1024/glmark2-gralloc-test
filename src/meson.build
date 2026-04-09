@@ -80,7 +80,7 @@ common_deps = [
 # Gralloc support sources (for DRM and GBM renderers)
 gralloc_support_sources = []
 gralloc_support_deps = []
-if need_drm or need_gbm
+if need_egl
     gralloc_support_sources += ['gralloc_egl_image.cpp']
     gralloc_support_deps += [libdrm_dep, gbm_dep]
 endif

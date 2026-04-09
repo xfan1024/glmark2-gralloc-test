@@ -67,7 +67,12 @@ CanvasGeneric::init()
         int use_gralloc_val = atoi(use_gralloc_env);
         if (use_gralloc_val != 0) {
             gralloc_enabled_ = true;
+            fprintf(stderr, "[Gralloc] Enabled via USE_GRALLOC=%s\n", use_gralloc_env);
+        } else {
+            fprintf(stderr, "[Gralloc] Disabled via USE_GRALLOC=%s\n", use_gralloc_env);
         }
+    } else {
+        fprintf(stderr, "[Gralloc] USE_GRALLOC not set\n");
     }
 #endif
 
@@ -511,7 +516,10 @@ CanvasGeneric::ensure_fbo()
 #ifdef GLMARK2_USE_EGL
         if (gralloc_enabled_) {
             /* Use gralloc to allocate EGLImages for FBOs */
+            fprintf(stderr, "[Gralloc] ensure_fbo: Allocating %u FBO(s) with gralloc\n", offscreen_);
+            
             if (egl_display_ == EGL_NO_DISPLAY) {
+                fprintf(stderr, "[Gralloc] ERROR: EGL display not available for gralloc\n");
                 Log::error("EGL display not available for gralloc\n");
                 return false;
             }
@@ -521,20 +529,27 @@ CanvasGeneric::ensure_fbo()
             void *egl_proc_loader = nullptr;
             if (egl_state) {
                 egl_proc_loader = egl_state->egl_get_proc_address_ptr();
+                fprintf(stderr, "[Gralloc] Got EGL proc loader\n");
+            } else {
+                fprintf(stderr, "[Gralloc] WARNING: Could not get EGL state\n");
             }
             
             for (unsigned int i = 0; i < offscreen_; ++i) {
+                fprintf(stderr, "[Gralloc] Allocating FBO %u (size: %ux%u)\n", i, width_, height_);
                 struct gralloc_image img = gralloc_alloc_image(egl_display_, 
                                                                width_, height_);
                 if (img.image == EGL_NO_IMAGE_KHR) {
+                    fprintf(stderr, "[Gralloc] ERROR: Failed to allocate gralloc image for FBO %u\n", i);
                     Log::error("Failed to allocate gralloc image for FBO %u\n", i);
                     return false;
                 }
+                fprintf(stderr, "[Gralloc] FBO %u: EGLImage allocated (0x%p)\n", i, img.image);
                 
                 fbos_.emplace_back(width_, height_, gl_color_format_,
                                    gl_depth_format_, true, egl_display_, img,
                                    (GRALLOC_EGLGETPROCADDRESS)egl_proc_loader);
             }
+            fprintf(stderr, "[Gralloc] ensure_fbo: All %u FBO(s) allocated successfully\n", offscreen_);
         } else
 #endif
         {
@@ -559,13 +574,21 @@ CanvasGeneric::release_fbo()
 #ifdef GLMARK2_USE_EGL
     if (gralloc_enabled_) {
         /* Free gralloc images before clearing FBOs */
+        fprintf(stderr, "[Gralloc] release_fbo: Freeing %zu FBO(s) with gralloc\n", fbos_.size());
+        
         if (egl_display_ != EGL_NO_DISPLAY) {
+            unsigned int freed_count = 0;
             for (auto& fbo : fbos_) {
                 if (fbo.use_gralloc && fbo.egl_image.image != EGL_NO_IMAGE_KHR) {
+                    fprintf(stderr, "[Gralloc] Freeing EGLImage 0x%p\n", fbo.egl_image.image);
                     gralloc_free_image(egl_display_, fbo.egl_image);
                     fbo.egl_image.image = EGL_NO_IMAGE_KHR;
+                    freed_count++;
                 }
             }
+            fprintf(stderr, "[Gralloc] release_fbo: Freed %u gralloc image(s)\n", freed_count);
+        } else {
+            fprintf(stderr, "[Gralloc] WARNING: release_fbo called with invalid EGL display\n");
         }
     }
 #endif

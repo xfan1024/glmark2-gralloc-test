@@ -88,21 +88,12 @@ static unsigned int gbm_usage_flag_from_token(const char *token)
     if (strcmp(token, "rendering") == 0) {
         return GBM_BO_USE_RENDERING;
     }
-#ifdef GBM_BO_USE_WRITE
     if (strcmp(token, "write") == 0) {
         return GBM_BO_USE_WRITE;
     }
-#endif
-#ifdef GBM_BO_USE_LINEAR
     if (strcmp(token, "linear") == 0) {
         return GBM_BO_USE_LINEAR;
     }
-#endif
-#ifdef GBM_BO_USE_TEXTURING
-    if (strcmp(token, "texturing") == 0) {
-        return GBM_BO_USE_TEXTURING;
-    }
-#endif
 
     fprintf(stderr, "unknown GBM_USAGE token: %s\n", token);
     exit(1);
@@ -155,27 +146,35 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
     int dma_fd = -1;
     uint32_t stride = 0;
 
+    fprintf(stderr, "[Gralloc_GBM] Allocating GBM buffer (%dx%d)\n", width, height);
+    
     bo = gbm_bo_create(g_gralloc.gbm,
                        (uint32_t)width,
                        (uint32_t)height,
                        GBM_FORMAT_XRGB8888,
                        gbm_usage_from_env());
     if (!bo) {
+        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_create failed\n");
         die_msg("gbm_bo_create failed");
     }
+    fprintf(stderr, "[Gralloc_GBM] GBM buffer object created\n");
 
     dma_fd = gbm_bo_get_fd(bo);
     if (dma_fd < 0) {
+        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_get_fd failed\n");
         gbm_bo_destroy(bo);
         die_msg("gbm_bo_get_fd failed");
     }
+    fprintf(stderr, "[Gralloc_GBM] Got DMA-BUF FD: %d\n", dma_fd);
 
     stride = gbm_bo_get_stride(bo);
     if (stride == 0) {
+        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_get_stride returned 0\n");
         close(dma_fd);
         gbm_bo_destroy(bo);
         die_msg("gbm_bo_get_stride returned 0");
     }
+    fprintf(stderr, "[Gralloc_GBM] Buffer stride: %u bytes\n", stride);
 
     EGLint attrs[] = {
         EGL_WIDTH, width,
@@ -187,6 +186,7 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
         EGL_NONE
     };
 
+    fprintf(stderr, "[Gralloc_GBM] Creating EGLImage from DMA-BUF\n");
     out.image = p_eglCreateImageKHR(dpy,
                                     EGL_NO_CONTEXT,
                                     EGL_LINUX_DMA_BUF_EXT,
@@ -196,9 +196,11 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
     close(dma_fd);
 
     if (out.image == EGL_NO_IMAGE_KHR) {
+        fprintf(stderr, "[Gralloc_GBM] ERROR: eglCreateImageKHR failed\n");
         gbm_bo_destroy(bo);
         die_msg("eglCreateImageKHR failed for GBM path");
     }
+    fprintf(stderr, "[Gralloc_GBM] EGLImage created successfully: %p\n", out.image);
 
     out.priv = (void *)bo;
     return out;
@@ -260,12 +262,18 @@ void gralloc_init(GRALLOC_EGLGETPROCADDRESS get_proc_address)
     const char *gbm_dev = getenv("GBM_DEV");
     const char *dumb_dev = getenv("DUMB_DEV");
 
+    fprintf(stderr, "[Gralloc_Init] Starting gralloc initialization\n");
+    fprintf(stderr, "[Gralloc_Init] GBM_DEV=%s, DUMB_DEV=%s\n", 
+            gbm_dev ? gbm_dev : "(not set)", 
+            dumb_dev ? dumb_dev : "(not set)");
+
     g_gralloc.backend = GRALLOC_BACKEND_NONE;
     g_gralloc.devfd = -1;
     g_gralloc.gbm = NULL;
     g_gralloc.get_proc_address = get_proc_address;
 
     init_egl_procs();
+    fprintf(stderr, "[Gralloc_Init] EGL procs initialized\n");
 
     if (gbm_dev && gbm_dev[0] && dumb_dev && dumb_dev[0]) {
         die_msg("GBM_DEV and DUMB_DEV are both set; exactly one must be set");
@@ -276,25 +284,35 @@ void gralloc_init(GRALLOC_EGLGETPROCADDRESS get_proc_address)
     }
 
     if (gbm_dev && gbm_dev[0]) {
+        fprintf(stderr, "[Gralloc_Init] Using GBM backend with device: %s\n", gbm_dev);
         g_gralloc.backend = GRALLOC_BACKEND_GBM;
         g_gralloc.devfd = open_dev(gbm_dev);
+        fprintf(stderr, "[Gralloc_Init] Opened GBM device fd=%d\n", g_gralloc.devfd);
         g_gralloc.gbm = gbm_create_device(g_gralloc.devfd);
         if (!g_gralloc.gbm) {
             close(g_gralloc.devfd);
             g_gralloc.devfd = -1;
+            fprintf(stderr, "[Gralloc_Init] ERROR: gbm_create_device failed\n");
             die_msg("gbm_create_device failed");
         }
+        fprintf(stderr, "[Gralloc_Init] GBM device initialized successfully\n");
         return;
     }
 
+    fprintf(stderr, "[Gralloc_Init] Using DUMB backend with device: %s\n", dumb_dev);
     g_gralloc.backend = GRALLOC_BACKEND_DUMB;
     g_gralloc.devfd = open_dev(dumb_dev);
+    fprintf(stderr, "[Gralloc_Init] Opened DUMB device fd=%d\n", g_gralloc.devfd);
+    fprintf(stderr, "[Gralloc_Init] DUMB backend initialized\n");
 }
 
 void gralloc_deinit(void)
 {
+    fprintf(stderr, "[Gralloc_Deinit] Cleaning up gralloc resources\n");
+    
     switch (g_gralloc.backend) {
     case GRALLOC_BACKEND_GBM:
+        fprintf(stderr, "[Gralloc_Deinit] Destroying GBM device\n");
         if (g_gralloc.gbm) {
             gbm_device_destroy(g_gralloc.gbm);
             g_gralloc.gbm = NULL;
@@ -317,18 +335,24 @@ void gralloc_deinit(void)
 
 struct gralloc_image gralloc_alloc_image(EGLDisplay dpy, int width, int height)
 {
+    fprintf(stderr, "[Gralloc_Alloc] gralloc_alloc_image called: %dx%d\n", width, height);
+    
     if (width <= 0 || height <= 0) {
+        fprintf(stderr, "[Gralloc_Alloc] ERROR: invalid width/height\n");
         die_msg("gralloc_alloc_image: invalid width/height");
     }
 
     switch (g_gralloc.backend) {
     case GRALLOC_BACKEND_GBM:
+        fprintf(stderr, "[Gralloc_Alloc] Using GBM backend\n");
         return alloc_image_from_gbm(dpy, width, height);
 
     case GRALLOC_BACKEND_DUMB:
+        fprintf(stderr, "[Gralloc_Alloc] Using DUMB backend\n");
         return alloc_image_from_dumb(dpy, width, height);
 
     default:
+        fprintf(stderr, "[Gralloc_Alloc] ERROR: invalid backend (%d)\n", g_gralloc.backend);
         die_msg("gralloc_alloc_image: invalid backend");
         return gralloc_image {};
     }
@@ -336,28 +360,36 @@ struct gralloc_image gralloc_alloc_image(EGLDisplay dpy, int width, int height)
 
 void gralloc_free_image(EGLDisplay dpy, struct gralloc_image img)
 {
+    fprintf(stderr, "[Gralloc_Free] Freeing image %p\n", img.image);
+    
     if (img.image != EGL_NO_IMAGE_KHR) {
         if (!p_eglDestroyImageKHR(dpy, img.image)) {
+            fprintf(stderr, "[Gralloc_Free] ERROR: eglDestroyImageKHR failed\n");
             die_msg("eglDestroyImageKHR failed");
         }
+        fprintf(stderr, "[Gralloc_Free] EGLImage destroyed\n");
     }
 
     if (!img.priv) {
+        fprintf(stderr, "[Gralloc_Free] No private data to free\n");
         return;
     }
 
     switch (g_gralloc.backend) {
     case GRALLOC_BACKEND_GBM:
+        fprintf(stderr, "[Gralloc_Free] Destroying GBM buffer object\n");
         gbm_bo_destroy((struct gbm_bo *)img.priv);
         return;
 
     case GRALLOC_BACKEND_DUMB: {
         uint32_t handle = (uint32_t)(uintptr_t)img.priv;
+        fprintf(stderr, "[Gralloc_Free] Destroying DUMB buffer handle %u\n", handle);
         destroy_dumb_handle(handle);
         return;
     }
 
     default:
+        fprintf(stderr, "[Gralloc_Free] ERROR: invalid backend (%d)\n", g_gralloc.backend);
         die_msg("gralloc_free_image: invalid backend");
         return;
     }
