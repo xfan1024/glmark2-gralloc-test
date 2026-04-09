@@ -77,6 +77,14 @@ common_deps = [
     libmatrix_headers_dep,
 ]
 
+# Gralloc support sources (for DRM and GBM renderers)
+gralloc_support_sources = []
+gralloc_support_deps = []
+if need_drm or need_gbm
+    gralloc_support_sources += ['gralloc_egl_image.cpp']
+    gralloc_support_deps += [libdrm_dep, gbm_dep]
+endif
+
 # The include/ directory contains some POSIX functionality missing from msvc.
 if cpp.get_id() == 'msvc'
     common_deps += declare_dependency(
@@ -230,8 +238,8 @@ if need_gl
 
     lib_common_gl = static_library(
         'common-gl',
-        common_sources,
-        dependencies: [gl_gl_dep, common_deps],
+        common_sources + gralloc_support_sources,
+        dependencies: [gl_gl_dep, common_deps] + gralloc_support_deps,
         include_directories: [
             include_directories('scene-ideas'),
             include_directories('scene-terrain'),
@@ -260,8 +268,8 @@ if need_glesv2
 
     lib_common_glesv2 = static_library(
         'common-glesv2',
-        common_sources,
-        dependencies: [gl_glesv2_dep, common_deps],
+        common_sources + gralloc_support_sources,
+        dependencies: [gl_glesv2_dep, common_deps] + gralloc_support_deps,
         include_directories: [
             include_directories('scene-ideas'),
             include_directories('scene-terrain'),

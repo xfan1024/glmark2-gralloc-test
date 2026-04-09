@@ -155,6 +155,12 @@ public:
     void getVisualConfig(GLVisualConfig& vc);
     bool supports_sync();
     std::unique_ptr<GLStateSync> sync();
+    
+    /* Get the EGLDisplay for gralloc and other operations */
+    EGLDisplay display() const { return egl_display_; }
+    
+    /* Get eglGetProcAddress function pointer for dynamic function loading */
+    void *egl_get_proc_address_ptr() const;
 };
 
 #endif // GLMARK2_GL_STATE_EGL_H_

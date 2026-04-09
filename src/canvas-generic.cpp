@@ -23,6 +23,7 @@
 #include "canvas-generic.h"
 #include "native-state.h"
 #include "gl-state.h"
+#include "gl-state-egl.h"
 #include "log.h"
 #include "options.h"
 #include "util.h"
@@ -30,6 +31,12 @@
 
 #include <fstream>
 #include <sstream>
+#include <cstdlib>
+
+#ifdef GLMARK2_USE_EGL
+/* Function pointer type for glEGLImageTargetRenderbufferStorageOES */
+typedef void (*PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)(GLenum target, GLeglImageOES image);
+#endif
 
 /******************
  * Public methods *
@@ -37,6 +44,11 @@
 
 CanvasGeneric::~CanvasGeneric()
 {
+#ifdef GLMARK2_USE_EGL
+    if (gralloc_enabled_ && gralloc_initialized_) {
+        gralloc_deinit();
+    }
+#endif
 }
 
 bool
@@ -47,6 +59,17 @@ CanvasGeneric::init()
 
     if (!gl_state_.init_display(native_state_.display(), visual_config_))
         return false;
+
+#ifdef GLMARK2_USE_EGL
+    /* Check if gralloc mode is requested */
+    const char *use_gralloc_env = getenv("USE_GRALLOC");
+    if (use_gralloc_env) {
+        int use_gralloc_val = atoi(use_gralloc_env);
+        if (use_gralloc_val != 0) {
+            gralloc_enabled_ = true;
+        }
+    }
+#endif
 
     return reset();
 }
@@ -61,6 +84,21 @@ CanvasGeneric::reset()
 
     if (!resize_no_viewport(width_, height_))
         return false;
+
+#ifdef GLMARK2_USE_EGL
+    /* Initialize gralloc if needed and not already initialized */
+    if (gralloc_enabled_ && !gralloc_initialized_) {
+        /* Get the EGL proc loader from GLStateEGL */
+        GLStateEGL *egl_state = dynamic_cast<GLStateEGL*>(&gl_state_);
+        if (egl_state) {
+            void *egl_proc_addr = egl_state->egl_get_proc_address_ptr();
+            if (egl_proc_addr) {
+                gralloc_init((GRALLOC_EGLGETPROCADDRESS)egl_proc_addr);
+                gralloc_initialized_ = true;
+            }
+        }
+    }
+#endif
 
     if (!do_make_current())
         return false;
@@ -341,6 +379,20 @@ CanvasGeneric::do_make_current()
     if (!gl_state_.init_gl_extensions())
         return false;
 
+#ifdef GLMARK2_USE_EGL
+    /* Try to get EGL display for gralloc */
+    if (egl_display_ == EGL_NO_DISPLAY) {
+        try {
+            GLStateEGL* egl_state = dynamic_cast<GLStateEGL*>(&gl_state_);
+            if (egl_state) {
+                egl_display_ = egl_state->display();
+            }
+        } catch (...) {
+            /* Not an EGL state, that's okay */
+        }
+    }
+#endif
+
     if (offscreen_) {
         if (!GLExtensions::GenFramebuffers) {
             Log::error("Off-screen rendering requires GL framebuffer support\n");
@@ -456,10 +508,43 @@ CanvasGeneric::ensure_fbo()
         if (!ensure_gl_formats())
             return false;
 
-        for (unsigned int i = 0; i < offscreen_; ++i) {
-            fbos_.emplace_back(width_, height_, gl_color_format_,
-                               gl_depth_format_);
+#ifdef GLMARK2_USE_EGL
+        if (gralloc_enabled_) {
+            /* Use gralloc to allocate EGLImages for FBOs */
+            if (egl_display_ == EGL_NO_DISPLAY) {
+                Log::error("EGL display not available for gralloc\n");
+                return false;
+            }
+            
+            /* Get EGL proc loader from GLStateEGL */
+            GLStateEGL *egl_state = dynamic_cast<GLStateEGL*>(&gl_state_);
+            void *egl_proc_loader = nullptr;
+            if (egl_state) {
+                egl_proc_loader = egl_state->egl_get_proc_address_ptr();
+            }
+            
+            for (unsigned int i = 0; i < offscreen_; ++i) {
+                struct gralloc_image img = gralloc_alloc_image(egl_display_, 
+                                                               width_, height_);
+                if (img.image == EGL_NO_IMAGE_KHR) {
+                    Log::error("Failed to allocate gralloc image for FBO %u\n", i);
+                    return false;
+                }
+                
+                fbos_.emplace_back(width_, height_, gl_color_format_,
+                                   gl_depth_format_, true, egl_display_, img,
+                                   (GRALLOC_EGLGETPROCADDRESS)egl_proc_loader);
+            }
+        } else
+#endif
+        {
+            /* Use traditional renderbuffer-based FBOs */
+            for (unsigned int i = 0; i < offscreen_; ++i) {
+                fbos_.emplace_back(width_, height_, gl_color_format_,
+                                   gl_depth_format_);
+            }
         }
+        
         fbo_syncs_.resize(offscreen_);
 
         current_fbo_index_ = 0;
@@ -471,6 +556,20 @@ CanvasGeneric::ensure_fbo()
 void
 CanvasGeneric::release_fbo()
 {
+#ifdef GLMARK2_USE_EGL
+    if (gralloc_enabled_) {
+        /* Free gralloc images before clearing FBOs */
+        if (egl_display_ != EGL_NO_DISPLAY) {
+            for (auto& fbo : fbos_) {
+                if (fbo.use_gralloc && fbo.egl_image.image != EGL_NO_IMAGE_KHR) {
+                    gralloc_free_image(egl_display_, fbo.egl_image);
+                    fbo.egl_image.image = EGL_NO_IMAGE_KHR;
+                }
+            }
+        }
+    }
+#endif
+    
     fbos_.clear();
     fbo_syncs_.clear();
     gl_color_format_ = 0;
@@ -502,6 +601,7 @@ CanvasGeneric::get_gl_format_str(GLenum f)
 CanvasGeneric::FBO::FBO(GLsizei width, GLsizei height, GLuint color_format,
                         GLuint depth_format)
 {
+    /* Create a renderbuffer for the color attachment */
     GLExtensions::GenRenderbuffers(1, &color_renderbuffer);
     GLExtensions::BindRenderbuffer(GL_RENDERBUFFER, color_renderbuffer);
     GLExtensions::RenderbufferStorage(GL_RENDERBUFFER, color_format,
@@ -521,6 +621,51 @@ CanvasGeneric::FBO::FBO(GLsizei width, GLsizei height, GLuint color_format,
     GLExtensions::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
                                           GL_RENDERBUFFER, depth_renderbuffer);
 }
+
+#ifdef GLMARK2_USE_EGL
+CanvasGeneric::FBO::FBO(GLsizei width, GLsizei height, GLuint color_format,
+                        GLuint depth_format,
+                        bool use_gralloc, EGLDisplay dpy, struct gralloc_image egl_img,
+                        GRALLOC_EGLGETPROCADDRESS egl_proc_loader)
+    : use_gralloc(use_gralloc), egl_image(egl_img)
+{
+    if (use_gralloc && egl_image.image != EGL_NO_IMAGE_KHR && egl_proc_loader) {
+        /* Use EGLImage as color renderbuffer */
+        GLExtensions::GenRenderbuffers(1, &color_renderbuffer);
+        GLExtensions::BindRenderbuffer(GL_RENDERBUFFER, color_renderbuffer);
+        
+        /* Bind EGLImage to renderbuffer storage using the loader */
+        typedef void (*PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC)(GLenum target, void* image);
+        PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC glEGLImageTargetRenderbufferStorageOES =
+            reinterpret_cast<PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC>(
+                egl_proc_loader("glEGLImageTargetRenderbufferStorageOES"));
+        
+        if (glEGLImageTargetRenderbufferStorageOES) {
+            glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, egl_image.image);
+        }
+    } else {
+        /* Fallback to traditional renderbuffer */
+        GLExtensions::GenRenderbuffers(1, &color_renderbuffer);
+        GLExtensions::BindRenderbuffer(GL_RENDERBUFFER, color_renderbuffer);
+        GLExtensions::RenderbufferStorage(GL_RENDERBUFFER, color_format,
+                                          width, height);
+    }
+
+    /* Create a renderbuffer for the depth attachment */
+    GLExtensions::GenRenderbuffers(1, &depth_renderbuffer);
+    GLExtensions::BindRenderbuffer(GL_RENDERBUFFER, depth_renderbuffer);
+    GLExtensions::RenderbufferStorage(GL_RENDERBUFFER, depth_format,
+                                      width, height);
+
+    /* Create a FBO and set it up */
+    GLExtensions::GenFramebuffers(1, &fbo);
+    GLExtensions::BindFramebuffer(GL_FRAMEBUFFER, fbo);
+    GLExtensions::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                          GL_RENDERBUFFER, color_renderbuffer);
+    GLExtensions::FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                          GL_RENDERBUFFER, depth_renderbuffer);
+}
+#endif
 
 CanvasGeneric::FBO::~FBO()
 {

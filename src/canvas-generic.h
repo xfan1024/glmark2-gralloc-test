@@ -25,6 +25,11 @@
 
 #include "canvas.h"
 
+#ifdef GLMARK2_USE_EGL
+#include <glad/egl.h>
+#include "gralloc_egl_image.h"
+#endif
+
 #include <vector>
 #include <memory>
 
@@ -43,7 +48,12 @@ public:
         : Canvas(width, height),
           native_state_(native_state), gl_state_(gl_state), native_window_(0),
           gl_color_format_(0), gl_depth_format_(0),
-          current_fbo_index_(0), window_initialized_(false) {}
+          current_fbo_index_(0), window_initialized_(false)
+#ifdef GLMARK2_USE_EGL
+          , egl_display_(EGL_NO_DISPLAY),
+            gralloc_enabled_(false), gralloc_initialized_(false)
+#endif
+    {}
     ~CanvasGeneric();
 
     bool init();
@@ -69,6 +79,15 @@ private:
 
     struct FBO {
         FBO(GLsizei width, GLsizei height, GLuint color_format, GLuint depth_format);
+#ifdef GLMARK2_USE_EGL
+        FBO(GLsizei width, GLsizei height, GLuint color_format, GLuint depth_format,
+            bool use_gralloc, EGLDisplay dpy, struct gralloc_image egl_img,
+            GRALLOC_EGLGETPROCADDRESS egl_proc_loader);
+        
+        // Gralloc EGLImage support
+        bool use_gralloc = false;
+        struct gralloc_image egl_image = {};
+#endif
         ~FBO();
         GLuint color_renderbuffer;
         GLuint depth_renderbuffer;
@@ -85,6 +104,14 @@ private:
     int current_fbo_index_;
     bool gl_sync_supported_;
     bool window_initialized_;
+    
+#ifdef GLMARK2_USE_EGL
+    EGLDisplay egl_display_;
+    
+    // Gralloc support
+    bool gralloc_enabled_;
+    bool gralloc_initialized_;
+#endif
 };
 
 #endif /* GLMARK2_CANVAS_GENERIC_H_ */

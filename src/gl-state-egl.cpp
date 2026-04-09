@@ -864,3 +864,10 @@ GLStateEGL::gotValidContext()
 
     return true;
 }
+
+/* Get the eglGetProcAddress function pointer for dynamic function loading */
+void *
+GLStateEGL::egl_get_proc_address_ptr() const
+{
+    return egl_lib_.load("eglGetProcAddress");
+}
