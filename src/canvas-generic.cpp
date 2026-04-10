@@ -166,6 +166,14 @@ CanvasGeneric::update()
             m = Options::FrameEndSwap;
     }
 
+    /* Handle gralloc resolve_begin for current frame (after GPU work) */
+#ifdef GLMARK2_USE_EGL
+    if (gralloc_enabled_ && offscreen_ && fbos_[current_fbo_index_].use_gralloc &&
+        (m == Options::FrameEndNone || m == Options::FrameEndFinish)) {
+        gralloc_image_resolve_begin(fbos_[current_fbo_index_].egl_image, egl_display_);
+    }
+#endif
+
     switch(m) {
         case Options::FrameEndSwap:
             gl_state_.swap();
@@ -183,6 +191,14 @@ CanvasGeneric::update()
     }
 
     if (offscreen_) {
+        /* Complete gralloc resolve for previous frame (before switching FBO) */
+#ifdef GLMARK2_USE_EGL
+        int prev_fbo_index = (current_fbo_index_ - 1 + fbos_.size()) % fbos_.size();
+        if (gralloc_enabled_ && fbos_[prev_fbo_index].use_gralloc) {
+            gralloc_image_resolve_end(fbos_[prev_fbo_index].egl_image, egl_display_);
+        }
+#endif
+
         current_fbo_index_ = (current_fbo_index_ + 1) % fbos_.size();
         if (fbo_syncs_[current_fbo_index_]) {
             fbo_syncs_[current_fbo_index_]->wait();
@@ -538,7 +554,7 @@ CanvasGeneric::ensure_fbo()
                 fprintf(stderr, "[Gralloc] Allocating FBO %u (size: %ux%u)\n", i, width_, height_);
                 struct gralloc_image img = gralloc_alloc_image(egl_display_, 
                                                                width_, height_);
-                if (img.image == EGL_NO_IMAGE_KHR) {
+                if (img.image == EGL_NO_IMAGE) {
                     fprintf(stderr, "[Gralloc] ERROR: Failed to allocate gralloc image for FBO %u\n", i);
                     Log::error("Failed to allocate gralloc image for FBO %u\n", i);
                     return false;
@@ -579,10 +595,10 @@ CanvasGeneric::release_fbo()
         if (egl_display_ != EGL_NO_DISPLAY) {
             unsigned int freed_count = 0;
             for (auto& fbo : fbos_) {
-                if (fbo.use_gralloc && fbo.egl_image.image != EGL_NO_IMAGE_KHR) {
+                if (fbo.use_gralloc && fbo.egl_image.image != EGL_NO_IMAGE) {
                     fprintf(stderr, "[Gralloc] Freeing EGLImage 0x%p\n", fbo.egl_image.image);
                     gralloc_free_image(egl_display_, fbo.egl_image);
-                    fbo.egl_image.image = EGL_NO_IMAGE_KHR;
+                    fbo.egl_image.image = EGL_NO_IMAGE;
                     freed_count++;
                 }
             }
@@ -652,7 +668,7 @@ CanvasGeneric::FBO::FBO(GLsizei width, GLsizei height, GLuint color_format,
                         GRALLOC_EGLGETPROCADDRESS egl_proc_loader)
     : use_gralloc(use_gralloc), egl_image(egl_img)
 {
-    if (use_gralloc && egl_image.image != EGL_NO_IMAGE_KHR && egl_proc_loader) {
+    if (use_gralloc && egl_image.image != EGL_NO_IMAGE && egl_proc_loader) {
         /* Use EGLImage as color renderbuffer */
         GLExtensions::GenRenderbuffers(1, &color_renderbuffer);
         GLExtensions::BindRenderbuffer(GL_RENDERBUFFER, color_renderbuffer);

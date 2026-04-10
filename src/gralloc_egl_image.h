@@ -4,28 +4,6 @@
 #include <stdint.h>
 #include <glad/egl.h>
 
-/* Alias for KHR naming convention (glad provides EGL_NO_IMAGE) */
-#ifndef EGL_NO_IMAGE_KHR
-#define EGL_NO_IMAGE_KHR EGL_NO_IMAGE
-#endif
-
-/* EGL DMA-BUF extension constants (EGL_EXT_image_dma_buf_import) */
-#ifndef EGL_LINUX_DMA_BUF_EXT
-#define EGL_LINUX_DMA_BUF_EXT                0x3270
-#endif
-#ifndef EGL_LINUX_DRM_FOURCC_EXT
-#define EGL_LINUX_DRM_FOURCC_EXT             0x3271
-#endif
-#ifndef EGL_DMA_BUF_PLANE0_FD_EXT
-#define EGL_DMA_BUF_PLANE0_FD_EXT            0x3272
-#endif
-#ifndef EGL_DMA_BUF_PLANE0_OFFSET_EXT
-#define EGL_DMA_BUF_PLANE0_OFFSET_EXT        0x3273
-#endif
-#ifndef EGL_DMA_BUF_PLANE0_PITCH_EXT
-#define EGL_DMA_BUF_PLANE0_PITCH_EXT         0x3274
-#endif
-
 /* Function pointer type for EGL proc loader */
 typedef void* (*GRALLOC_EGLGETPROCADDRESS)(const char *procname);
 
@@ -44,5 +22,41 @@ void gralloc_deinit(void);
 
 struct gralloc_image gralloc_alloc_image(EGLDisplay dpy, int width, int height);
 void gralloc_free_image(EGLDisplay dpy, struct gralloc_image img);
+
+/**
+ * Begin GPU fence-based buffer resolution.
+ * 
+ * Call immediately after rendering. Creates an EGL fence to track GPU operations.
+ * The fence is stored internally and will be waited for in gralloc_resolve_end().
+ * 
+ * @param img: the gralloc image to resolve
+ * @param dpy: EGL display
+ */
+void gralloc_image_resolve_begin(struct gralloc_image img, EGLDisplay dpy);
+
+/**
+ * Complete buffer resolution by waiting for GPU fence.
+ * 
+ * Waits for the GPU fence created by gralloc_resolve_begin(), then:
+ * 1. Performs DMA-BUF CPU sync start
+ * 2. Accesses buffer pages to ensure coherency
+ * 3. Performs DMA-BUF CPU sync end
+ * 
+ * Fallback to glFinish if fence creation failed in begin().
+ * 
+ * @param img: the gralloc image to resolve
+ * @param dpy: EGL display
+ */
+void gralloc_image_resolve_end(struct gralloc_image img, EGLDisplay dpy);
+
+/**
+ * Convenience function: resolve DMA-BUF after GPU operations.
+ * 
+ * Uses glFinish directly for simpler semantics when start/end split is not needed.
+ * Does NOT use fence mechanism - simpler but potentially less optimal for pipelining.
+ * 
+ * @param img: the gralloc image to resolve
+ */
+void gralloc_image_resolve(struct gralloc_image img);
 
 #endif

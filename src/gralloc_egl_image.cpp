@@ -7,6 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -14,9 +17,50 @@
 
 #include <gbm.h>
 
+#include "libmatrix/log.h"
+
+/* Alias for KHR naming convention (glad provides EGL_NO_IMAGE) */
+#ifndef EGL_NO_IMAGE_KHR
+#define EGL_NO_IMAGE_KHR EGL_NO_IMAGE
+#endif
+
+/* EGL Sync extension constants (EGL_KHR_fence_sync) */
+#ifndef EGL_NO_SYNC_KHR
+#define EGL_NO_SYNC_KHR EGL_NO_SYNC
+#endif
+#ifndef EGL_SYNC_FENCE_KHR
+#define EGL_SYNC_FENCE_KHR EGL_SYNC_FENCE
+#endif
+#ifndef EGL_FOREVER_KHR
+#define EGL_FOREVER_KHR EGL_FOREVER
+#endif
+
+/* EGL DMA-BUF extension constants (EGL_EXT_image_dma_buf_import) */
+#ifndef EGL_LINUX_DMA_BUF_EXT
+#define EGL_LINUX_DMA_BUF_EXT                0x3270
+#endif
+#ifndef EGL_LINUX_DRM_FOURCC_EXT
+#define EGL_LINUX_DRM_FOURCC_EXT             0x3271
+#endif
+#ifndef EGL_DMA_BUF_PLANE0_FD_EXT
+#define EGL_DMA_BUF_PLANE0_FD_EXT            0x3272
+#endif
+#ifndef EGL_DMA_BUF_PLANE0_OFFSET_EXT
+#define EGL_DMA_BUF_PLANE0_OFFSET_EXT        0x3273
+#endif
+#ifndef EGL_DMA_BUF_PLANE0_PITCH_EXT
+#define EGL_DMA_BUF_PLANE0_PITCH_EXT         0x3274
+#endif
+
 /* EGL function pointer types (avoid direct EGL header inclusion) */
 typedef EGLImage (*PFNEGLCREATEIMAGEKHRPROC)(EGLDisplay dpy, void *ctx, unsigned int target, void *buffer, const int *attrib_list);
 typedef int (*PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay dpy, EGLImage image);
+typedef EGLSync (*PFNEGLCREATESYNCKHRPROC)(EGLDisplay dpy, EGLenum type, const EGLint *attrib_list);
+typedef EGLint (*PFNEGLCLIENTWAITSYNCKHRPROC)(EGLDisplay dpy, EGLSync sync, EGLint flags, EGLTimeKHR timeout);
+typedef EGLBoolean (*PFNEGLDESTROYSYNCKHPROC)(EGLDisplay dpy, EGLSync sync);
+
+/* GL function pointer type */
+typedef void (*PFNGLFINISHPROC)(void);
 
 enum gralloc_backend_type {
     GRALLOC_BACKEND_NONE = 0,
@@ -29,22 +73,44 @@ struct gralloc_platform {
     int devfd;
     struct gbm_device *gbm;
     GRALLOC_EGLGETPROCADDRESS get_proc_address;
+    size_t page_size;
+};
+
+struct gralloc_image_priv_base {
+    int dma_fd;
+    void *buf_ptr;
+    size_t buf_size;
+    EGLSync resolve_sync;  /* Fence for GPU sync */
+};
+
+struct gralloc_image_priv_gbm {
+    struct gralloc_image_priv_base base;
+    struct gbm_bo *bo;
+};
+
+struct gralloc_image_priv_dumb {
+    struct gralloc_image_priv_base base;
+    uint32_t handle;
 };
 
 static struct gralloc_platform g_gralloc = {};
 
 static PFNEGLCREATEIMAGEKHRPROC p_eglCreateImageKHR = NULL;
 static PFNEGLDESTROYIMAGEKHRPROC p_eglDestroyImageKHR = NULL;
+static PFNEGLCREATESYNCKHRPROC p_eglCreateSyncKHR = NULL;
+static PFNEGLCLIENTWAITSYNCKHRPROC p_eglClientWaitSyncKHR = NULL;
+static PFNEGLDESTROYSYNCKHPROC p_eglDestroySyncKHR = NULL;
+static PFNGLFINISHPROC p_glFinish = NULL;
 
 static void die_errno(const char *msg)
 {
-    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+    Log::error("%s: %s", msg, strerror(errno));
     exit(1);
 }
 
 static void die_msg(const char *msg)
 {
-    fprintf(stderr, "%s\n", msg);
+    Log::error("%s", msg);
     exit(1);
 }
 
@@ -58,6 +124,15 @@ static void init_egl_procs(void)
         (PFNEGLCREATEIMAGEKHRPROC)g_gralloc.get_proc_address("eglCreateImageKHR");
     p_eglDestroyImageKHR =
         (PFNEGLDESTROYIMAGEKHRPROC)g_gralloc.get_proc_address("eglDestroyImageKHR");
+
+    p_eglCreateSyncKHR = (PFNEGLCREATESYNCKHRPROC)g_gralloc.get_proc_address("eglCreateSyncKHR");
+    p_eglClientWaitSyncKHR = (PFNEGLCLIENTWAITSYNCKHRPROC)g_gralloc.get_proc_address("eglClientWaitSyncKHR");
+    p_eglDestroySyncKHR = (PFNEGLDESTROYSYNCKHPROC)g_gralloc.get_proc_address("eglDestroySyncKHR");
+
+    p_glFinish = (PFNGLFINISHPROC)g_gralloc.get_proc_address("glFinish");
+    if (!p_glFinish) {
+        die_msg("get_proc_address(\"glFinish\") failed");
+    }
 
     if (!p_eglCreateImageKHR) {
         die_msg("get_proc_address(\"eglCreateImageKHR\") failed");
@@ -95,7 +170,7 @@ static unsigned int gbm_usage_flag_from_token(const char *token)
         return GBM_BO_USE_LINEAR;
     }
 
-    fprintf(stderr, "unknown GBM_USAGE token: %s\n", token);
+    Log::error("unknown GBM_USAGE token: %s", token);
     exit(1);
 }
 
@@ -139,6 +214,81 @@ static void destroy_dumb_handle(uint32_t handle)
     }
 }
 
+static void cleanup_base(struct gralloc_image_priv_base *base)
+{
+    if (!base) {
+        return;
+    }
+
+    /* Destroy pending sync if any */
+    if (base->resolve_sync != EGL_NO_SYNC_KHR) {
+        Log::warning("Destroying pending resolve_sync");
+        p_eglDestroySyncKHR(eglGetDisplay(EGL_DEFAULT_DISPLAY), base->resolve_sync);
+        base->resolve_sync = EGL_NO_SYNC_KHR;
+    }
+
+    /* Unmap buffer if it was mapped */
+    if (base->buf_ptr != NULL && base->buf_size > 0) {
+        if (munmap(base->buf_ptr, base->buf_size) < 0) {
+            Log::warning("munmap failed: %s", strerror(errno));
+        } else {
+            Log::debug("Buffer unmapped");
+        }
+    }
+    
+    /* Close DMA-BUF FD */
+    if (base->dma_fd >= 0) {
+        close(base->dma_fd);
+        Log::debug("DMA-BUF FD closed");
+    }
+}
+
+/* Get base pointer from image (base is at offset 0 for both GBM and DUMB) */
+static struct gralloc_image_priv_base *get_base_from_image(struct gralloc_image img)
+{
+    if (img.image == EGL_NO_IMAGE_KHR || !img.priv) {
+        return NULL;
+    }
+    return (struct gralloc_image_priv_base *)img.priv;
+}
+
+/* Memory load helper: touch each page */
+static void access_buffer_pages(struct gralloc_image_priv_base *base)
+{
+    if (!base || !base->buf_ptr || base->buf_size == 0) {
+        return;
+    }
+
+    size_t num_pages = (base->buf_size + g_gralloc.page_size - 1) / g_gralloc.page_size;
+    Log::debug("Accessing %zu pages (%zu bytes)", num_pages, base->buf_size);
+
+    for (size_t i = 0; i < num_pages; i++) {
+        volatile int *page_ptr = (volatile int *)((uintptr_t)base->buf_ptr + (i * g_gralloc.page_size));
+        int dummy = *page_ptr;  /* Read first int from page */
+        (void)dummy;  /* Prevent compiler optimization */
+    }
+}
+
+/* DMA-BUF sync begin */
+static void dma_buf_sync_begin(int dma_fd)
+{
+    struct dma_buf_sync sync = {};
+    sync.flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START;
+    if (ioctl(dma_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+        Log::warning("DMA_BUF_IOCTL_SYNC START failed: %s", strerror(errno));
+    }
+}
+
+/* DMA-BUF sync end */
+static void dma_buf_sync_end(int dma_fd)
+{
+    struct dma_buf_sync sync = {};
+    sync.flags = DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END;
+    if (ioctl(dma_fd, DMA_BUF_IOCTL_SYNC, &sync) < 0) {
+        Log::warning("DMA_BUF_IOCTL_SYNC END failed: %s", strerror(errno));
+    }
+}
+
 static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int height)
 {
     struct gralloc_image out = {};
@@ -146,7 +296,7 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
     int dma_fd = -1;
     uint32_t stride = 0;
 
-    fprintf(stderr, "[Gralloc_GBM] Allocating GBM buffer (%dx%d)\n", width, height);
+    Log::debug("Allocating GBM buffer %dx%d", width, height);
     
     bo = gbm_bo_create(g_gralloc.gbm,
                        (uint32_t)width,
@@ -154,27 +304,27 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
                        GBM_FORMAT_XRGB8888,
                        gbm_usage_from_env());
     if (!bo) {
-        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_create failed\n");
+        Log::error("gbm_bo_create failed");
         die_msg("gbm_bo_create failed");
     }
-    fprintf(stderr, "[Gralloc_GBM] GBM buffer object created\n");
+    Log::debug("GBM buffer object created");
 
     dma_fd = gbm_bo_get_fd(bo);
     if (dma_fd < 0) {
-        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_get_fd failed\n");
+        Log::error("gbm_bo_get_fd failed");
         gbm_bo_destroy(bo);
         die_msg("gbm_bo_get_fd failed");
     }
-    fprintf(stderr, "[Gralloc_GBM] Got DMA-BUF FD: %d\n", dma_fd);
+    Log::debug("DMA-BUF FD: %d", dma_fd);
 
     stride = gbm_bo_get_stride(bo);
     if (stride == 0) {
-        fprintf(stderr, "[Gralloc_GBM] ERROR: gbm_bo_get_stride returned 0\n");
+        Log::error("gbm_bo_get_stride returned 0");
         close(dma_fd);
         gbm_bo_destroy(bo);
         die_msg("gbm_bo_get_stride returned 0");
     }
-    fprintf(stderr, "[Gralloc_GBM] Buffer stride: %u bytes\n", stride);
+    Log::debug("Buffer stride: %u bytes", stride);
     uint32_t offset = gbm_bo_get_offset(bo, 0);
     uint64_t mod = gbm_bo_get_modifier(bo);
     EGLint attrs[] = {
@@ -189,23 +339,44 @@ static struct gralloc_image alloc_image_from_gbm(EGLDisplay dpy, int width, int 
         EGL_NONE
     };
 
-    fprintf(stderr, "[Gralloc_GBM] Creating EGLImage from DMA-BUF\n");
     out.image = p_eglCreateImageKHR(dpy,
                                     EGL_NO_CONTEXT,
                                     EGL_LINUX_DMA_BUF_EXT,
                                     NULL,
                                     attrs);
 
-    close(dma_fd);
-
     if (out.image == EGL_NO_IMAGE_KHR) {
-        fprintf(stderr, "[Gralloc_GBM] ERROR: eglCreateImageKHR failed\n");
+        Log::error("eglCreateImageKHR failed");
+        close(dma_fd);
         gbm_bo_destroy(bo);
         die_msg("eglCreateImageKHR failed for GBM path");
     }
-    fprintf(stderr, "[Gralloc_GBM] EGLImage created successfully: %p\n", out.image);
+    Log::debug("EGLImage created: %p", out.image);
 
-    out.priv = (void *)bo;
+    struct gralloc_image_priv_gbm *priv = (struct gralloc_image_priv_gbm *)malloc(sizeof(*priv));
+    if (!priv) {
+        p_eglDestroyImageKHR(dpy, out.image);
+        close(dma_fd);
+        gbm_bo_destroy(bo);
+        die_msg("malloc failed");
+    }
+    
+    size_t buf_size = (size_t)stride * (size_t)height;
+    void *buf_ptr = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
+    if (buf_ptr == MAP_FAILED) {
+        Log::debug("[Gralloc_GBM] WARNING: mmap failed: %s (continuing without cpu access)", strerror(errno));
+        buf_ptr = NULL;
+    } else {
+        Log::debug("[Gralloc_GBM] Buffer mapped: %p (size %zu)", buf_ptr, buf_size);
+    }
+    
+    priv->base.dma_fd = dma_fd;  /* Keep open for lifetime of buffer */
+    priv->base.buf_ptr = buf_ptr;
+    priv->base.buf_size = buf_size;
+    priv->base.resolve_sync = EGL_NO_SYNC_KHR;
+    priv->bo = bo;
+    
+    out.priv = (void *)priv;
     return out;
 }
 
@@ -252,14 +423,36 @@ static struct gralloc_image alloc_image_from_dumb(EGLDisplay dpy, int width, int
                                     NULL,
                                     attrs);
 
-    close(dma_fd);
-
     if (out.image == EGL_NO_IMAGE_KHR) {
+        close(dma_fd);
         destroy_dumb_handle(create_req.handle);
         die_msg("eglCreateImageKHR failed for dumb path");
     }
 
-    out.priv = (void *)(uintptr_t)create_req.handle;
+    struct gralloc_image_priv_dumb *priv = (struct gralloc_image_priv_dumb *)malloc(sizeof(*priv));
+    if (!priv) {
+        p_eglDestroyImageKHR(dpy, out.image);
+        close(dma_fd);
+        destroy_dumb_handle(create_req.handle);
+        die_msg("malloc failed");
+    }
+    
+    size_t buf_size = (size_t)create_req.pitch * (size_t)height;
+    void *buf_ptr = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
+    if (buf_ptr == MAP_FAILED) {
+        Log::warning("mmap failed: %s (continuing without CPU access)", strerror(errno));
+        buf_ptr = NULL;
+    } else {
+        Log::debug("Buffer mapped: %p (%zu bytes)", buf_ptr, buf_size);
+    }
+    
+    priv->base.dma_fd = dma_fd;  /* Keep open for lifetime of buffer */
+    priv->base.buf_ptr = buf_ptr;
+    priv->base.buf_size = buf_size;
+    priv->base.resolve_sync = EGL_NO_SYNC_KHR;
+    priv->handle = create_req.handle;
+    
+    out.priv = (void *)priv;
     return out;
 }
 
@@ -268,8 +461,8 @@ void gralloc_init(GRALLOC_EGLGETPROCADDRESS get_proc_address)
     const char *gbm_dev = getenv("GBM_DEV");
     const char *dumb_dev = getenv("DUMB_DEV");
 
-    fprintf(stderr, "[Gralloc_Init] Starting gralloc initialization\n");
-    fprintf(stderr, "[Gralloc_Init] GBM_DEV=%s, DUMB_DEV=%s\n", 
+    Log::info("Initializing gralloc");
+    Log::debug("GBM_DEV=%s, DUMB_DEV=%s", 
             gbm_dev ? gbm_dev : "(not set)", 
             dumb_dev ? dumb_dev : "(not set)");
 
@@ -277,9 +470,11 @@ void gralloc_init(GRALLOC_EGLGETPROCADDRESS get_proc_address)
     g_gralloc.devfd = -1;
     g_gralloc.gbm = NULL;
     g_gralloc.get_proc_address = get_proc_address;
+    g_gralloc.page_size = sysconf(_SC_PAGESIZE);
+    Log::debug("Page size: %zu bytes", g_gralloc.page_size);
 
     init_egl_procs();
-    fprintf(stderr, "[Gralloc_Init] EGL procs initialized\n");
+    Log::debug("EGL procs initialized");
 
     if (gbm_dev && gbm_dev[0] && dumb_dev && dumb_dev[0]) {
         die_msg("GBM_DEV and DUMB_DEV are both set; exactly one must be set");
@@ -290,35 +485,30 @@ void gralloc_init(GRALLOC_EGLGETPROCADDRESS get_proc_address)
     }
 
     if (gbm_dev && gbm_dev[0]) {
-        fprintf(stderr, "[Gralloc_Init] Using GBM backend with device: %s\n", gbm_dev);
+        Log::info("Using GBM backend: %s", gbm_dev);
         g_gralloc.backend = GRALLOC_BACKEND_GBM;
         g_gralloc.devfd = open_dev(gbm_dev);
-        fprintf(stderr, "[Gralloc_Init] Opened GBM device fd=%d\n", g_gralloc.devfd);
         g_gralloc.gbm = gbm_create_device(g_gralloc.devfd);
         if (!g_gralloc.gbm) {
             close(g_gralloc.devfd);
             g_gralloc.devfd = -1;
-            fprintf(stderr, "[Gralloc_Init] ERROR: gbm_create_device failed\n");
+            Log::error("gbm_create_device failed");
             die_msg("gbm_create_device failed");
         }
-        fprintf(stderr, "[Gralloc_Init] GBM device initialized successfully\n");
+        Log::debug("GBM device ready");
         return;
     }
 
-    fprintf(stderr, "[Gralloc_Init] Using DUMB backend with device: %s\n", dumb_dev);
+    Log::info("Using DUMB backend: %s", dumb_dev);
     g_gralloc.backend = GRALLOC_BACKEND_DUMB;
     g_gralloc.devfd = open_dev(dumb_dev);
-    fprintf(stderr, "[Gralloc_Init] Opened DUMB device fd=%d\n", g_gralloc.devfd);
-    fprintf(stderr, "[Gralloc_Init] DUMB backend initialized\n");
+    Log::debug("DUMB device ready");
 }
 
 void gralloc_deinit(void)
 {
-    fprintf(stderr, "[Gralloc_Deinit] Cleaning up gralloc resources\n");
-    
     switch (g_gralloc.backend) {
     case GRALLOC_BACKEND_GBM:
-        fprintf(stderr, "[Gralloc_Deinit] Destroying GBM device\n");
         if (g_gralloc.gbm) {
             gbm_device_destroy(g_gralloc.gbm);
             g_gralloc.gbm = NULL;
@@ -341,24 +531,20 @@ void gralloc_deinit(void)
 
 struct gralloc_image gralloc_alloc_image(EGLDisplay dpy, int width, int height)
 {
-    fprintf(stderr, "[Gralloc_Alloc] gralloc_alloc_image called: %dx%d\n", width, height);
-    
     if (width <= 0 || height <= 0) {
-        fprintf(stderr, "[Gralloc_Alloc] ERROR: invalid width/height\n");
+        Log::error("invalid width/height: %dx%d", width, height);
         die_msg("gralloc_alloc_image: invalid width/height");
     }
 
     switch (g_gralloc.backend) {
     case GRALLOC_BACKEND_GBM:
-        fprintf(stderr, "[Gralloc_Alloc] Using GBM backend\n");
         return alloc_image_from_gbm(dpy, width, height);
 
     case GRALLOC_BACKEND_DUMB:
-        fprintf(stderr, "[Gralloc_Alloc] Using DUMB backend\n");
         return alloc_image_from_dumb(dpy, width, height);
 
     default:
-        fprintf(stderr, "[Gralloc_Alloc] ERROR: invalid backend (%d)\n", g_gralloc.backend);
+        Log::error("invalid backend: %d", g_gralloc.backend);
         die_msg("gralloc_alloc_image: invalid backend");
         return gralloc_image {};
     }
@@ -366,37 +552,112 @@ struct gralloc_image gralloc_alloc_image(EGLDisplay dpy, int width, int height)
 
 void gralloc_free_image(EGLDisplay dpy, struct gralloc_image img)
 {
-    fprintf(stderr, "[Gralloc_Free] Freeing image %p\n", img.image);
-    
     if (img.image != EGL_NO_IMAGE_KHR) {
         if (!p_eglDestroyImageKHR(dpy, img.image)) {
-            fprintf(stderr, "[Gralloc_Free] ERROR: eglDestroyImageKHR failed\n");
+            Log::error("eglDestroyImageKHR failed");
             die_msg("eglDestroyImageKHR failed");
         }
-        fprintf(stderr, "[Gralloc_Free] EGLImage destroyed\n");
     }
 
     if (!img.priv) {
-        fprintf(stderr, "[Gralloc_Free] No private data to free\n");
         return;
     }
 
+    /* Clean up base (common for both backends) */
+    struct gralloc_image_priv_base *base = (struct gralloc_image_priv_base *)img.priv;
+    cleanup_base(base);
+
     switch (g_gralloc.backend) {
-    case GRALLOC_BACKEND_GBM:
-        fprintf(stderr, "[Gralloc_Free] Destroying GBM buffer object\n");
-        gbm_bo_destroy((struct gbm_bo *)img.priv);
+    case GRALLOC_BACKEND_GBM: {
+        struct gralloc_image_priv_gbm *priv = (struct gralloc_image_priv_gbm *)img.priv;
+        
+        /* Destroy GBM buffer object */
+        if (priv->bo) {
+            gbm_bo_destroy(priv->bo);
+        }
+        
+        free(priv);
         return;
+    }
 
     case GRALLOC_BACKEND_DUMB: {
-        uint32_t handle = (uint32_t)(uintptr_t)img.priv;
-        fprintf(stderr, "[Gralloc_Free] Destroying DUMB buffer handle %u\n", handle);
-        destroy_dumb_handle(handle);
+        struct gralloc_image_priv_dumb *priv = (struct gralloc_image_priv_dumb *)img.priv;
+        
+        /* Destroy DUMB buffer handle */
+        destroy_dumb_handle(priv->handle);
+        
+        free(priv);
         return;
     }
 
     default:
-        fprintf(stderr, "[Gralloc_Free] ERROR: invalid backend (%d)\n", g_gralloc.backend);
+        Log::error("invalid backend: %d", g_gralloc.backend);
         die_msg("gralloc_free_image: invalid backend");
         return;
+    }
+}
+
+void gralloc_image_resolve_begin(struct gralloc_image img, EGLDisplay dpy)
+{
+    struct gralloc_image_priv_base *base = get_base_from_image(img);
+    
+    if (!base) {
+        Log::error("invalid image");
+        return;
+    }
+
+    base->resolve_sync = p_eglCreateSyncKHR(dpy, EGL_SYNC_FENCE_KHR, NULL);
+    
+    if (base->resolve_sync == EGL_NO_SYNC_KHR) {
+        Log::warning("eglCreateSyncKHR failed, will use glFinish fallback");
+    } else {
+        Log::debug("Fence created");
+    }
+}
+
+void gralloc_image_resolve_end(struct gralloc_image img, EGLDisplay dpy)
+{
+    struct gralloc_image_priv_base *base = get_base_from_image(img);
+    
+    if (!base) {
+        Log::error("invalid image");
+        return;
+    }
+
+    /* Wait for GPU fence if available */
+    if (base->resolve_sync != EGL_NO_SYNC_KHR) {
+        p_eglClientWaitSyncKHR(dpy, base->resolve_sync, 0, EGL_FOREVER_KHR);
+        p_eglDestroySyncKHR(dpy, base->resolve_sync);
+        base->resolve_sync = EGL_NO_SYNC_KHR;
+    } else {
+        Log::debug("No fence available, using glFinish fallback");
+        p_glFinish();
+    }
+
+    /* Now safe to access buffer from CPU */
+    if (base->dma_fd >= 0) {
+        dma_buf_sync_begin(base->dma_fd);
+        access_buffer_pages(base);
+        dma_buf_sync_end(base->dma_fd);
+    }
+}
+
+void gralloc_image_resolve(struct gralloc_image img)
+{
+    struct gralloc_image_priv_base *base = get_base_from_image(img);
+    
+    if (!base) {
+        Log::error("invalid image");
+        return;
+    }
+
+    /* Direct path using glFinish - simpler semantics */
+    p_glFinish();
+
+    /* Now safe to access buffer from CPU */
+    if (base->dma_fd >= 0) {
+        dma_buf_sync_begin(base->dma_fd);
+        access_buffer_pages(base);
+        dma_buf_sync_end(base->dma_fd);
     }
 }
