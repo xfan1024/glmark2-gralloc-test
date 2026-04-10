@@ -232,14 +232,26 @@ static void cleanup_base(struct gralloc_image_priv_base *base)
         if (munmap(base->buf_ptr, base->buf_size) < 0) {
             Log::warning("munmap failed: %s", strerror(errno));
         } else {
-            Log::debug("Buffer unmapped");
+            if (g_gralloc.backend == GRALLOC_BACKEND_GBM) {
+                Log::debug("[Gralloc_GBM] Buffer unmapped from DMA-BUF FD");
+            } else if (g_gralloc.backend == GRALLOC_BACKEND_DUMB) {
+                Log::debug("[Gralloc_DUMB] Buffer unmapped from device FD");
+            } else {
+                Log::debug("Buffer unmapped");
+            }
         }
     }
     
-    /* Close DMA-BUF FD */
+    /* Close DMA-BUF FD (used for EGLImage, needed for both backends) */
     if (base->dma_fd >= 0) {
         close(base->dma_fd);
-        Log::debug("DMA-BUF FD closed");
+        if (g_gralloc.backend == GRALLOC_BACKEND_GBM) {
+            Log::debug("[Gralloc_GBM] DMA-BUF FD closed");
+        } else if (g_gralloc.backend == GRALLOC_BACKEND_DUMB) {
+            Log::debug("[Gralloc_DUMB] DMA-BUF FD closed");
+        } else {
+            Log::debug("DMA-BUF FD closed");
+        }
     }
 }
 
@@ -437,13 +449,30 @@ static struct gralloc_image alloc_image_from_dumb(EGLDisplay dpy, int width, int
         die_msg("malloc failed");
     }
     
+    /* Use DRM_IOCTL_MODE_MAP_DUMB to get CPU-mappable offset */
+    struct drm_mode_map_dumb map_req = {};
+    map_req.handle = create_req.handle;
+    if (drmIoctl(g_gralloc.devfd, DRM_IOCTL_MODE_MAP_DUMB, &map_req) < 0) {
+        Log::warning("DRM_IOCTL_MODE_MAP_DUMB failed: %s (continuing without CPU access)", strerror(errno));
+        priv->base.dma_fd = dma_fd;
+        priv->base.buf_ptr = NULL;
+        priv->base.buf_size = 0;
+        priv->base.resolve_sync = EGL_NO_SYNC_KHR;
+        priv->handle = create_req.handle;
+        out.priv = (void *)priv;
+        return out;
+    }
+    
+    /* mmap using the device fd and the offset from MAP_DUMB ioctl */
     size_t buf_size = (size_t)create_req.pitch * (size_t)height;
-    void *buf_ptr = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, dma_fd, 0);
+    void *buf_ptr = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, 
+                         g_gralloc.devfd, map_req.offset);
     if (buf_ptr == MAP_FAILED) {
         Log::warning("mmap failed: %s (continuing without CPU access)", strerror(errno));
         buf_ptr = NULL;
     } else {
-        Log::debug("Buffer mapped: %p (%zu bytes)", buf_ptr, buf_size);
+        Log::debug("[Gralloc_DUMB] Buffer mapped: %p (size %zu, offset 0x%llx)", 
+                   buf_ptr, buf_size, (unsigned long long)map_req.offset);
     }
     
     priv->base.dma_fd = dma_fd;  /* Keep open for lifetime of buffer */
