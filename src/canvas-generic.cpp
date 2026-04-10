@@ -166,14 +166,6 @@ CanvasGeneric::update()
             m = Options::FrameEndSwap;
     }
 
-    /* Handle gralloc resolve_begin for current frame (after GPU work) */
-#ifdef GLMARK2_USE_EGL
-    if (gralloc_enabled_ && offscreen_ && fbos_[current_fbo_index_].use_gralloc &&
-        (m == Options::FrameEndNone || m == Options::FrameEndFinish)) {
-        gralloc_image_resolve_begin(fbos_[current_fbo_index_].egl_image, egl_display_);
-    }
-#endif
-
     switch(m) {
         case Options::FrameEndSwap:
             gl_state_.swap();
@@ -190,15 +182,14 @@ CanvasGeneric::update()
             break;
     }
 
-    if (offscreen_) {
-        /* Complete gralloc resolve for previous frame (before switching FBO) */
+    /* Immediately resolve gralloc buffer after rendering completes */
 #ifdef GLMARK2_USE_EGL
-        int prev_fbo_index = (current_fbo_index_ - 1 + fbos_.size()) % fbos_.size();
-        if (gralloc_enabled_ && fbos_[prev_fbo_index].use_gralloc) {
-            gralloc_image_resolve_end(fbos_[prev_fbo_index].egl_image, egl_display_);
-        }
+    if (gralloc_enabled_ && offscreen_ && fbos_[current_fbo_index_].use_gralloc) {
+        gralloc_image_resolve(fbos_[current_fbo_index_].egl_image);
+    }
 #endif
 
+    if (offscreen_) {
         current_fbo_index_ = (current_fbo_index_ + 1) % fbos_.size();
         if (fbo_syncs_[current_fbo_index_]) {
             fbo_syncs_[current_fbo_index_]->wait();
